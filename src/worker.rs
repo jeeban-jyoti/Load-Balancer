@@ -1,7 +1,8 @@
-use http::Version;
+use http::{request, Version};
 use libc::*;
-use std::collections::HashMap;
-use std::ffi::{CStr, CString};
+use std::collections::{HashMap, HashSet};
+use std::ffi::{CStr,CString};
+// use std::io::Read;
 use std::mem::{self, zeroed};
 use std::net::Ipv4Addr;
 use std::os::fd::RawFd;
@@ -10,7 +11,7 @@ use http::{Request, header::{HeaderName, HeaderValue}};
 use httparse::{Request as HttpParseRequest, Status};
 
 extern crate queues;
-use queues::*;
+// use queues::*;
 
 const SOCK_PATH: &str = "/tmp/test1.sock";
 
@@ -109,12 +110,13 @@ fn get_client_ip(fd: RawFd) -> Option<String> {
     }
 }
 
-fn modify_headers(mut request: Request<Vec<u8>>, fd: i32, server: [u8; 6]) -> Request<Vec<u8>> {
+fn modify_headers(mut request: Request<Vec<u8>>, fd: i32, server: [u8; 10]) -> Request<Vec<u8>> {
     let mut host = String::new();
-    for i in 0..4 {
+    for i in 0..3 {
         host.push_str(&server[i].to_string());
         host.push('.');
     }
+    host.push_str(&server[3].to_string());
     host.push(':');
     host.push_str(&(((server[4] as i32) << 8) | (server[5] as i32)).to_string());
     request.headers_mut().insert(
@@ -166,7 +168,7 @@ fn parse_http_request(buffer: [u8; 1024]) -> Result<Request<Vec<u8>>, Box<dyn st
     Ok(builder.body(body)?)
 }
 
-fn serialize_request(req: Request<Vec<u8>>) -> [u8; 1024] {
+fn serialize_request(req: Request<Vec<u8>>) -> REQ {
     let mut buffer = [0u8; 1024];
     let mut vec = Vec::new();
 
@@ -194,22 +196,38 @@ fn serialize_request(req: Request<Vec<u8>>) -> [u8; 1024] {
 
     let copy_len = vec.len().min(1024);
     buffer[..copy_len].copy_from_slice(&vec[..copy_len]);
+    let mut termination_len = 0;
+    for i in 0..copy_len {
+        if buffer[i] != 0 {
+            buffer[i] = vec[i];
+        } else {
+            termination_len = i;
+            break;
+        }
+    }
+    print!("{} \n", termination_len);
 
-    buffer
+    REQ { req_data: buffer, n: termination_len }
 }
 
 fn when_identity_equals_conn_db_sock_fd(
     conn_db_sock_fd: i32,
-    client_queue: &mut Queue<REQ>,
+    req_map: &mut HashMap<RawFd, REQ>,
     server_client_mapping: *mut HashMap<RawFd, RawFd>,
     kq: i32,
     addr: sockaddr_un,
-    addr_len: u32 
+    addr_len: u32,
+    fd_ip_mapping: *mut HashMap<RawFd, [u8; 6]>,
+    server_reqs_mapping: *mut HashMap<[u8; 6], HashSet<RawFd>>,
+    conn_db_res_counter: &mut i32
 ) {
     unsafe {
-        let mut buf = [0u8; 6];
-        let n = read(conn_db_sock_fd, buf.as_mut_ptr() as *mut _, 6);
+        *conn_db_res_counter += 1;
+        let mut buf = [0u8; 10];
+        let n = read(conn_db_sock_fd, buf.as_mut_ptr() as *mut _, 10);
         if n > 0 {
+            let client_fd = RawFd::from_be_bytes(buf[6..10].try_into().unwrap());
+            let request = *req_map.get(&client_fd).unwrap();
             // println!("{:?}.{:?}.{:?}.{:?}:{:?}.{:?}", buf[0], buf[1], buf[2], buf[3], buf[4], buf[5]);
             let backend_services_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
             if backend_services_fd < 0 {
@@ -218,7 +236,7 @@ fn when_identity_equals_conn_db_sock_fd(
 
             let ip = Ipv4Addr::new(buf[0], buf[1], buf[2], buf[3]);
             let sockaddr_in = sockaddr_in {
-                sin_len: mem::size_of::<sockaddr_in>() as u8, // macOS uses sin_len field
+                sin_len: mem::size_of::<sockaddr_in>() as u8,
                 sin_family: AF_INET as u8,
                 sin_port: u16::to_be(((buf[4] as u16) << 8) | (buf[5] as u16)),
                 sin_addr: in_addr {
@@ -235,27 +253,80 @@ fn when_identity_equals_conn_db_sock_fd(
                 mem::size_of::<sockaddr_in>() as u32,
             );
             if ret < 0 {
+                del_fd_to_kqueue(kq, backend_services_fd as usize);
                 close(backend_services_fd);
-                panic!("Failed to connect to server");
+                
+                let mut conn_db_request = [0u8; 7];
+                conn_db_request[0] = 2;
+                for i in 1..7 {
+                    conn_db_request[i] = buf[i-1];
+                }
+
+                let db_conn_status = write(
+                    conn_db_sock_fd,
+                    conn_db_request.as_ptr() as *const _,
+                    conn_db_request.len(),
+                );
+                if db_conn_status < 0 {
+                    if connect(
+                        conn_db_sock_fd,
+                        &addr as *const _ as *const sockaddr,
+                        addr_len,
+                    ) < 0
+                    {
+                        panic!("connect failed");
+                    }
+
+                    // del_fd_to_kqueue(&kq, conn_db_sock_fd as usize);
+                    add_fd_to_kqueue(kq, conn_db_sock_fd as usize);
+
+                    write(
+                        conn_db_sock_fd,
+                        conn_db_request.as_ptr() as *const _,
+                        conn_db_request.len(),
+                    );
+                }
+
+                let mut request_bytes = [0u8; 7];
+                request_bytes[3..7].copy_from_slice(&client_fd.to_be_bytes());
+                write(
+                    conn_db_sock_fd,
+                    request_bytes.as_ptr() as *const _,
+                    request_bytes.len(),
+                );
+                let server: [u8; 6] = buf[..6].try_into().unwrap();
+                if let Some(fdi_set) = (*server_reqs_mapping).get(&server) {
+                    for &fdi in fdi_set {
+                        let mut request_bytes_i = [0u8; 7];
+                        request_bytes_i[3..7].copy_from_slice(&fdi.to_be_bytes());
+                        write(
+                            conn_db_sock_fd,
+                            request_bytes_i.as_ptr() as *const _,
+                            request_bytes_i.len(),
+                        );
+                    }
+                }
             }
 
-            let front_req = client_queue
-                .remove()
-                .expect("not able to read front req from client queue.");
-            let mut request = front_req.req_data;
             
-            request = serialize_request(modify_headers(parse_http_request(request).unwrap(), front_req.client_fd, buf));
-            // println!("{:?}", request);
+            let modified_request = serialize_request(modify_headers(parse_http_request(request.req_data).unwrap(), client_fd, buf));
+            // println!("{:?}", &modified_request.req_data[..modified_request.n]);
             let write_ret = write(
                 backend_services_fd,
-                request.as_ptr() as *const _,
-                request.len(),
+                modified_request.req_data.as_ptr() as *const _,
+                modified_request.n,
             );
             if write_ret < 0 {
                 close(backend_services_fd);
                 panic!("Failed to write to socket");
             }
-            (*server_client_mapping).insert(backend_services_fd, front_req.client_fd);
+            (*server_client_mapping).insert(backend_services_fd, client_fd);
+            (*fd_ip_mapping).insert(backend_services_fd, buf[..6].try_into().unwrap());
+            let server: [u8; 6] = buf[..6].try_into().unwrap();
+            (*server_reqs_mapping)
+                .entry(server)
+                .or_insert_with(HashSet::new)
+                .insert(client_fd);
             add_fd_to_kqueue(kq, backend_services_fd as usize);
 
             // write(front_req.client_fd, buf.as_ptr() as *const _, 1024);
@@ -273,9 +344,6 @@ fn when_identity_equals_conn_db_sock_fd(
             {
                 panic!("connect failed");
             }
-
-            // del_fd_to_kqueue(&kq, conn_db_sock_fd as usize);
-            add_fd_to_kqueue(kq, conn_db_sock_fd as usize);
         }
     }
 }
@@ -283,28 +351,75 @@ fn when_identity_equals_conn_db_sock_fd(
 fn when_identity_else(
     client_fd: i32,
     conn_db_sock_fd: i32,
-    client_queue: &mut Queue<REQ>,
+    req_map: &mut HashMap<RawFd, REQ>,
     server_client_mapping: *mut HashMap<RawFd, RawFd>,
     kq: i32,
     buf: [u8; 1024],
     n: usize,
     addr: sockaddr_un,
     addr_len: u32,
+    fd_ip_mapping: *mut HashMap<RawFd, [u8; 6]>,
+    server_reqs_mapping: *mut HashMap<[u8; 6], HashSet<RawFd>>,
+    server_counter: &mut i32,
+    client_counter: &mut i32
 ) {
     unsafe {
         match (*server_client_mapping).get(&client_fd) {
             Some(target_fd) => {
-                // print!("\n\n{:?}", buf);
+                // println!("\n\n{:?}", buf);
+                // println!("b");
+                *server_counter += 1;
                 write(*target_fd, buf[..n].as_ptr() as *const _, n);
-                close(*target_fd);
                 del_fd_to_kqueue(kq, *target_fd as usize);
                 (*server_client_mapping).remove(&target_fd);
+                if let Some(server_key) = (*fd_ip_mapping).get(&client_fd) {
+                    if let Some(fd_set) = (*server_reqs_mapping).get_mut(server_key) {
+                        fd_set.remove(&target_fd);
+                    }
+                }
+                close(*target_fd);
 
+                let mut conn_db_request = [1u8; 7];
+                let server = (*fd_ip_mapping).get(&client_fd).unwrap_or(&[0u8; 6]);
+                for i in 1..7 {
+                    conn_db_request[i] = server[i-1];
+                }
+
+                let db_conn_status = write(
+                    conn_db_sock_fd,
+                    conn_db_request.as_ptr() as *const _,
+                    conn_db_request.len(),
+                );
+                if db_conn_status < 0 {
+                    if connect(
+                        conn_db_sock_fd,
+                        &addr as *const _ as *const sockaddr,
+                        addr_len,
+                    ) < 0
+                    {
+                        panic!("connect failed");
+                    }
+
+                    // del_fd_to_kqueue(&kq, conn_db_sock_fd as usize);
+                    add_fd_to_kqueue(kq, conn_db_sock_fd as usize);
+
+                    write(
+                        conn_db_sock_fd,
+                        conn_db_request.as_ptr() as *const _,
+                        conn_db_request.len(),
+                    );
+                }
+                
+                (*fd_ip_mapping).remove(&client_fd);
                 del_fd_to_kqueue(kq, client_fd as usize);
+                close(client_fd);
             }
             None => {
                 // println!("{:?}", buf);
-                let request_bytes = [0u8; 7];
+                // println!("a");
+                *client_counter += 1;
+                let mut request_bytes = [0u8; 7];
+                request_bytes[3..7].copy_from_slice(&client_fd.to_be_bytes());
                 let db_conn_status = write(
                     conn_db_sock_fd,
                     request_bytes.as_ptr() as *const _,
@@ -330,26 +445,28 @@ fn when_identity_else(
                     );
                 }
 
-                client_queue
-                    .add(REQ {
-                        client_fd: client_fd,
-                        req_data: buf
-                    })
-                    .unwrap();
+                req_map.insert(client_fd, REQ { req_data: buf, n: n });
             }
         }
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 struct REQ {
-    client_fd: RawFd,
     req_data: [u8; 1024],
+    n: usize
 }
 
 pub fn worker_loop(sock_fd: i32) {
-    let mut client_queue: Queue<REQ> = queue![];
+    let mut req_maps: HashMap<RawFd, REQ> = HashMap::new();
     let mut server_client_mapping: HashMap<RawFd, RawFd> = HashMap::new();
+    let mut fd_ip_mapping: HashMap<RawFd, [u8; 6]> = HashMap::new();
+    let mut server_req_mapping: HashMap<[u8; 6], HashSet<RawFd>> = HashMap::new();
+    let mut server_backend_fd_mapping: HashMap<[u8; 6], Vec<RawFd>> = HashMap::new();
+
+    let mut client_counter = 0;
+    let mut server_counter = 0;
+    let mut conn_db_res_counter = 0;
 
     unsafe {
         let conn_db_sock_fd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -389,11 +506,14 @@ pub fn worker_loop(sock_fd: i32) {
                     } else if ev.ident == conn_db_sock_fd as usize {
                         when_identity_equals_conn_db_sock_fd(
                             conn_db_sock_fd,
-                            &mut client_queue,
+                            &mut req_maps,
                             &mut server_client_mapping,
                             kq,
                             addr,
                             addr_len,
+                            &mut fd_ip_mapping,
+                            &mut server_req_mapping,
+                            &mut conn_db_res_counter
                         );
                     } else {
                         let client_fd = ev.ident as i32;
@@ -401,19 +521,29 @@ pub fn worker_loop(sock_fd: i32) {
                         if client_fd >= 0 {
                             let mut buf = [0u8; 1024];
                             let n = read(client_fd, buf.as_mut_ptr() as *mut _, 1024);
-                            println!("message from: {} by {}", client_fd, std::process::id(),);
+                            // println!("message from: {} by {}", client_fd, std::process::id());
+                            // println!("{:?} {}", buf, n);
                             if n > 0 {
                                 when_identity_else(
                                     client_fd,
                                     conn_db_sock_fd,
-                                    &mut client_queue,
+                                    &mut req_maps,
                                     &mut server_client_mapping,
                                     kq,
                                     buf,
                                     n as usize,
                                     addr,
                                     addr_len,
+                                    &mut fd_ip_mapping,
+                                    &mut server_req_mapping,
+                                    &mut server_counter,
+                                    &mut client_counter
                                 );
+                            } else {
+                                // println!("{}, {}, {}", server_counter, client_counter, conn_db_res_counter);
+                                // println!("{}", req_maps.len());
+                                del_fd_to_kqueue(kq, client_fd as usize);
+                                close(client_fd);
                             }
                         }
                     }

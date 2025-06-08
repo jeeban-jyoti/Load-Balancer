@@ -114,7 +114,7 @@ impl LCS {
         Ok(())
     }
 
-    pub fn _delete(&mut self, server: &[u8; 6]) -> Result<(), &'static str> {
+    pub fn delete(&mut self, server: &[u8; 6]) -> Result<(), &'static str> {
         unsafe {
             let data_node = *self.server_node_map.get(server).ok_or("Key not found")?;
             let p = (&mut *data_node).prev;

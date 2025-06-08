@@ -63,6 +63,12 @@ pub fn manage_connections(worker_count: usize) {
                 [127, 0, 0, 1, 11, 186],
                 [127, 0, 0, 1, 11, 187],
                 [127, 0, 0, 1, 11, 188],
+                [127, 0, 0, 1, 11, 189],
+                [127, 0, 0, 1, 11, 190],
+                [127, 0, 0, 1, 11, 191],
+                [127, 0, 0, 1, 11, 192],
+                [127, 0, 0, 1, 11, 193],
+                [127, 0, 0, 1, 11, 194],
             ];
             for server in &servers {
                 data.insert(&server).expect("Insert failed");
@@ -154,16 +160,31 @@ pub fn manage_connections(worker_count: usize) {
                                     .expect("something went wrong in slicing");
                                 match req_type {
                                     0 => {
+                                        let mut response = [0u8; 10];
                                         let server = data.get_least_conn_server().unwrap();
+                                        response[..6].copy_from_slice(&server);
+                                        response[6..].copy_from_slice(&buf[3..7]);
+
+                                        // let stats = data.get_stats().unwrap();
+                                        // for (key, val) in stats {
+                                        //     println!("{:?} : {}", key, val);
+                                        // }
+                                        write(client_fd, response.as_ptr() as *const _, response.len());
                                         let _ = data.server_conn_increament(&server);
-                                        let stats = data.get_stats().unwrap();
-                                        for (key, val) in stats {
-                                            println!("{:?} : {}", key, val);
-                                        }
-                                        write(client_fd, server.as_ptr() as *const _, server.len());
                                     }
                                     1 => {
                                         let _ = data.server_conn_decreament(&server);
+                                        // let stats = data.get_stats().unwrap();
+                                        // for (key, val) in stats {
+                                        //     println!("{:?} : {}", key, val);
+                                        // }
+                                    }
+                                    2 => {
+                                        let _ = data.delete(&server);
+                                        // let stats = data.get_stats().unwrap();
+                                        // for (key, val) in stats {
+                                        //     println!("{:?} : {}", key, val);
+                                        // }
                                     }
                                     _ => {}
                                 };
